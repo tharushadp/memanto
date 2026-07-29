@@ -6,7 +6,7 @@ Handles agent creation, listing, and lifecycle management.
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 from moorcheh_sdk.exceptions import ConflictError
@@ -66,7 +66,8 @@ class AgentService:
             AgentAlreadyExistsError: If agent already exists
         """
         agent_file = self._get_agent_file(agent_create.agent_id)
-        
+        self.agents_dir.mkdir(parents=True, exist_ok=True)
+
         # Atomic lock: Create the file exclusively to prevent TOCTOU race conditions.
         # This guarantees only one thread can claim this agent ID.
         try:
@@ -82,8 +83,7 @@ class AgentService:
 
             # Create namespace in Moorcheh - CRITICAL: Must succeed.
             # `moorcheh_api_key` is honored on cloud; ignored on on-prem.
-            from memanto.app.clients.moorcheh import moorcheh_client
-            client = moorcheh_client.get_client(api_key=moorcheh_api_key)
+            client = get_moorcheh_client(api_key=moorcheh_api_key)
 
             try:
                 # Use Moorcheh SDK to create namespace with type="text"
@@ -97,7 +97,9 @@ class AgentService:
                 # than the cloud SDK's typed ConflictError when the namespace
                 # already exists. Match on message so both backends behave the same.
                 msg = str(e).lower()
-                if ("namespace" in msg and "already exists" in msg) or "conflict" in msg:
+                if (
+                    "namespace" in msg and "already exists" in msg
+                ) or "conflict" in msg:
                     print(f"[OK] Namespace already exists in Moorcheh: {namespace}")
                 else:
                     raise Exception(
@@ -106,6 +108,7 @@ class AgentService:
 
             # Create agent metadata
             from datetime import datetime, timezone
+
             agent = AgentInfo(
                 agent_id=agent_create.agent_id,
                 namespace=namespace,
