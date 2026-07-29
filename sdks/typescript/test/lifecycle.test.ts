@@ -177,7 +177,7 @@ describe("ServerLifecycle", () => {
 
     // Timer should still be active for SIGKILL escalation
     expect(vi.getTimerCount()).toBe(1);
-    
+
     // Simulate process finally exiting
     child.emit("exit");
     await expect(stopped).resolves.toBeUndefined();
