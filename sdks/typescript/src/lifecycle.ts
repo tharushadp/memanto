@@ -32,7 +32,11 @@ export interface ServerOptions {
 export class ServerLifecycle {
   private process: ChildProcess | null = null;
   private url: string | null = null;
-  private cleanupRegistered = false;
+  private cleanupHandlers: {
+    exit: () => void;
+    sigint: () => void;
+    sigterm: () => void;
+  } | null = null;
 
   constructor(private readonly opts: ServerOptions = {}) {}
 
@@ -67,6 +71,13 @@ export class ServerLifecycle {
 
     this.process = child;
     this.registerCleanup();
+    child.once("exit", () => {
+      if (this.process === child) {
+        this.unregisterCleanup();
+        this.process = null;
+        this.url = null;
+      }
+    });
 
     const baseUrl = `http://${host}:${port}`;
 
@@ -83,11 +94,23 @@ export class ServerLifecycle {
         }
       });
     });
+    void spawnError.catch(() => {});
 
-    await Promise.race([
-      this.waitForHealth(baseUrl, this.opts.healthTimeoutMs ?? 60_000),
-      spawnError,
-    ]);
+    try {
+      const healthPromise = this.waitForHealth(
+        baseUrl,
+        this.opts.healthTimeoutMs ?? 60_000,
+      );
+      void healthPromise.catch(() => {});
+      await Promise.race([
+        healthPromise,
+        spawnError,
+      ]);
+    } catch (err) {
+      this.unregisterCleanup();
+      if (this.process === child) this.process = null;
+      throw err;
+    }
     this.url = baseUrl;
     return baseUrl;
   }
@@ -96,35 +119,73 @@ export class ServerLifecycle {
     const child = this.process;
     this.process = null;
     this.url = null;
-    if (!child || child.killed) return;
+    this.unregisterCleanup();
+    if (
+      !child ||
+      child.exitCode !== null ||
+      child.signalCode !== null
+    ) return;
 
     let exited = false;
-    await new Promise<void>((resolve, reject) => {
-      child.once("exit", () => { exited = true; resolve(); });
-      child.kill("SIGTERM");
-      setTimeout(() => {
+    await new Promise<void>((resolve) => {
+      const forceKillTimer = setTimeout(() => {
         if (!exited) child.kill("SIGKILL");
       }, 5_000);
+      const onEnd = () => {
+        if (exited) return;
+        exited = true;
+        clearTimeout(forceKillTimer);
+        child.removeListener("exit", onEnd);
+        child.removeListener("error", onEnd);
+        resolve();
+      };
+      child.once("exit", onEnd);
+      child.once("error", onEnd);
+      child.kill("SIGTERM");
     });
   }
 
   private async waitForHealth(baseUrl: string, timeoutMs: number): Promise<void> {
+    const child = this.process;
+    if (!child) {
+      throw new Error("Server lifecycle stopped before becoming healthy.");
+    }
+
+    const assertActive = () => {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        throw new Error(
+          `memanto server exited before becoming healthy (code: ${child.exitCode}, signal: ${child.signalCode}).`,
+        );
+      }
+      if (this.process !== child) {
+        throw new Error("Server lifecycle stopped before becoming healthy.");
+      }
+    };
+
     const deadline = Date.now() + timeoutMs;
     let lastErr: unknown = null;
     while (Date.now() < deadline) {
-      if (this.process && this.process.exitCode !== null) {
-        throw new Error(
-          `memanto server exited with code ${this.process.exitCode} before becoming healthy.`,
-        );
-      }
+      assertActive();
+      let res: Response | null = null;
       try {
-        const res = await fetch(`${baseUrl}/health`);
-        if (res.ok) return;
+        const attemptTimeoutMs = Math.max(
+          1,
+          Math.min(2_000, deadline - Date.now()),
+        );
+        res = await fetch(`${baseUrl}/health`, {
+          signal: AbortSignal.timeout(attemptTimeoutMs),
+        });
+        await res.arrayBuffer();
       } catch (err) {
         lastErr = err;
       }
-      await sleep(250);
+      assertActive();
+      if (res?.ok) return;
+
+      const remainingMs = deadline - Date.now();
+      if (remainingMs > 0) await sleep(Math.min(250, remainingMs));
     }
+    assertActive();
     await this.stop();
     throw new Error(
       `memanto server at ${baseUrl} did not become healthy within ${timeoutMs}ms${
@@ -134,22 +195,35 @@ export class ServerLifecycle {
   }
 
   private registerCleanup(): void {
-    if (this.cleanupRegistered) return;
-    this.cleanupRegistered = true;
+    if (this.cleanupHandlers) return;
     const cleanup = () => {
       if (this.process && !this.process.killed) {
         this.process.kill("SIGTERM");
       }
     };
+    const sigint = () => {
+      cleanup();
+      process.exitCode ??= 130;
+      if (process.listenerCount("SIGINT") === 0) process.exit();
+    };
+    const sigterm = () => {
+      cleanup();
+      process.exitCode ??= 143;
+      if (process.listenerCount("SIGTERM") === 0) process.exit();
+    };
+    this.cleanupHandlers = { exit: cleanup, sigint, sigterm };
     process.once("exit", cleanup);
-    process.once("SIGINT", () => {
-      cleanup();
-      process.exit(130);
-    });
-    process.once("SIGTERM", () => {
-      cleanup();
-      process.exit(143);
-    });
+    process.once("SIGINT", sigint);
+    process.once("SIGTERM", sigterm);
+  }
+
+  private unregisterCleanup(): void {
+    const handlers = this.cleanupHandlers;
+    if (!handlers) return;
+    process.removeListener("exit", handlers.exit);
+    process.removeListener("SIGINT", handlers.sigint);
+    process.removeListener("SIGTERM", handlers.sigterm);
+    this.cleanupHandlers = null;
   }
 }
 
