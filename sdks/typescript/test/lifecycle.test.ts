@@ -157,7 +157,7 @@ describe("ServerLifecycle", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("settles shutdown when the child emits an error", async () => {
+  it("continues escalation when the child emits an error", async () => {
     vi.useFakeTimers();
     cleanupFns.push(() => vi.useRealTimers());
     const child = Object.assign(new EventEmitter(), {
@@ -175,6 +175,11 @@ describe("ServerLifecycle", () => {
     const stopped = life.stop();
     child.emit("error", new Error("signal delivery failed"));
 
+    // Timer should still be active for SIGKILL escalation
+    expect(vi.getTimerCount()).toBe(1);
+    
+    // Simulate process finally exiting
+    child.emit("exit");
     await expect(stopped).resolves.toBeUndefined();
     expect(vi.getTimerCount()).toBe(0);
   });

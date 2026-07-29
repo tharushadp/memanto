@@ -136,11 +136,12 @@ export class ServerLifecycle {
         exited = true;
         clearTimeout(forceKillTimer);
         child.removeListener("exit", onEnd);
-        child.removeListener("error", onEnd);
         resolve();
       };
       child.once("exit", onEnd);
-      child.once("error", onEnd);
+      // Catch error to prevent unhandled exception, but do not resolve.
+      // Wait for actual 'exit' or escalate to SIGKILL.
+      child.once("error", () => {});
       child.kill("SIGTERM");
     });
   }
